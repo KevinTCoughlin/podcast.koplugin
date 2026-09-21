@@ -11,18 +11,24 @@
 - [x] `bin/kopod` harness: subscribe → download → play → resume
 - [x] 68 tests; verified against three real feeds up to 19.3 MB / 2983 episodes
 
-## v0.2 — the KOReader surface
+## v0.2 — the KOReader surface ✅
 
-Deliberately after shoutkit.koplugin's UI is validated in the emulator, so the
-`Menu` / `Trapper` / `NetworkMgr` patterns are written once.
+Written after shoutkit.koplugin's UI was validated in the emulator, so the
+`Menu` / `Trapper` / `NetworkMgr` patterns were only worked out once.
 
-- [ ] `_meta.lua` and `main.lua`: Tools → Podcasts
-- [ ] Subscriptions list, add-by-URL, refresh (Trapper-wrapped, cancellable)
-- [ ] Episode list with download state, duration and position
-- [ ] Download queue with progress, and a "download on next connect" mode —
-      an e-reader is usually offline when you decide you want an episode
-- [ ] Now-playing with a real scrubber, which radio does not need and podcasts
-      cannot do without
+- [x] `_meta.lua` and `main.lua`: Tools → Podcasts
+- [x] Subscriptions list, add-by-URL, refresh-all, unsubscribe
+- [x] Episode list with download state, duration, position and show notes
+- [x] Now-playing with ±30 s seek and position persistence
+- [x] Feeds and downloads in a dismissable subprocess; cancelling a download
+      leaves the partial file it resumes from
+- [x] `just emulator-smoke`: 18 checks inside a real KOReader build, including
+      a live feed and a real download through KOReader's own luasec
+- [ ] A real scrubber rather than ±30 s buttons
+- [ ] Download queue and a "download on next connect" mode — an e-reader is
+      usually offline when you decide you want an episode
+- [ ] Live download progress (needs polling the file rather than a blocking
+      subprocess call)
 
 ## v0.3 — the things that make it usable daily
 

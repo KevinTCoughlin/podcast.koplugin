@@ -11,12 +11,12 @@ renders items to HTML/EPUB and drops enclosures; a
 open since 2017. `rssreader.koplugin` and `miniflux.koplugin` are text readers.
 A GitHub search for a KOReader podcast plugin returns nothing. So: this.
 
-> **Status: early, and there is no KOReader UI yet.** The feed parser, the
-> subscription store and the downloader work, are tested, and are exercisable
-> end to end from a desktop via `bin/kopod`. The in-KOReader surface is
-> deliberately deferred until the sibling radio plugin's widget patterns have
-> been validated in the emulator, so they get written once rather than twice.
-> See [ROADMAP.md](ROADMAP.md).
+> **Status: early, but it runs as a KOReader plugin.** Subscribe, refresh,
+> browse episodes, download and play — all working and verified against a real
+> KOReader build (`just emulator-smoke`, 18 checks including a live 2.1 MB feed
+> and a real download through KOReader's own luasec). The gap is **audio
+> backends**: only mpv is implemented, so on an actual e-reader everything
+> except playback works. See [ROADMAP.md](ROADMAP.md).
 
 ## What works today
 
@@ -57,6 +57,11 @@ Verified against real feeds, including a **19.3 MB, 2983-episode** one:
 
 ```
 podcast.koplugin/
+  main.lua           menu wiring
+  ui/
+    subscriptions.lua  the show list, add-by-URL, refresh-all
+    episodes.lua       episode list, download and playback actions
+    nowplaying.lua     transport, seek, and position persistence
   feed/
     xml.lua          pull parser: events, not a tree
     parser.lua       RSS 2.0 + Atom -> channel + episodes with audio
@@ -66,7 +71,7 @@ podcast.koplugin/
   koaudio/           ← vendored from shoutkit.koplugin (git subtree)
 ```
 
-### Four decisions worth knowing about
+### Five decisions worth knowing about
 
 **Events, not a tree.** A long-running show's feed is megabytes and carries a
 thousand `<item>` elements, each of which may hold an entire HTML show-notes
@@ -86,6 +91,12 @@ a partial file is always kept and always continued with a Range request. The
 luasocket path also detects a server that *ignores* Range and starts over
 rather than appending onto a stale prefix.
 
+**Feeds and downloads run in a subprocess.** `Trapper:dismissableRunInSubprocess`
+forks, so parsing a multi-megabyte feed cannot freeze the reader and the user
+can cancel. Dismissing SIGKILLs the child — which for a download leaves the
+partial file that `net/fetch.lua` resumes from, so cancelling at 90 % costs
+nothing.
+
 **Advertised metadata is not trusted.** Real feeds get it wrong: one episode in
 our test set advertises 17 MB and 18:05 but is actually 19.8 MB and 21:39.
 Enclosure length is used for display only; the downloader and the player use
@@ -96,11 +107,31 @@ what they actually get.
 Needs `luajit` and `mpv`. No luarocks, no KOReader checkout.
 
 ```sh
-just test            # 68 tests, dependency-free runner
-just check           # syntax-check every Lua file
+just test              # 68 unit tests, dependency-free runner
+just check             # syntax-check every Lua file
+just emulator-smoke    # load into real KOReader, assert 18 widget checks
+just emulator          # launch real KOReader to click around (Tools -> Podcasts)
 just cli list
-just vendor-koaudio   # pull koaudio updates from shoutkit.koplugin
+just install-kobo      # copy onto a Kobo mounted as USB mass storage
+just vendor-koaudio    # pull koaudio updates from shoutkit.koplugin
 ```
+
+`just emulator-smoke` is the one that matters. Unit tests cannot catch a wrong
+KOReader API call, because they never load KOReader's frontend; the emulator
+harness instantiates the real widgets and fails on exactly that. It downloads a
+KOReader release build for you and runs headless via SDL's dummy video driver,
+so it needs no display and works over SSH.
+
+## Installing on a device
+
+Copy the inner `podcast.koplugin/` directory into KOReader's `plugins/`. On Kobo
+that is `.adds/koreader/plugins/` on the KOBOeReader partition, and
+`just install-kobo` finds it for you — the device exposes no storage until you
+tap **Connect** on its screen.
+
+Then **Tools → Podcasts**. Subscribing, refreshing and downloading all work over
+the device's Wi-Fi, so episodes can be waiting on it. Playing reports **"No
+audio backend on this device"** until the ALSA/BlueALSA backend exists.
 
 State lives in `$KOPOD_HOME` (default `~/.kopod`), never in KOReader's settings.
 

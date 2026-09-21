@@ -143,17 +143,33 @@ function Library:unsubscribe(url)
     return true
 end
 
---- `complete` must be false when the feed was parsed with a max_episodes cap:
--- recording a capped count as the episode count would tell the user a
--- thousand-episode show has fifteen.
-function Library:record_refresh(url, feed, complete)
+--- Applies what a refresh learned about a show.
+--
+-- `info.count` is the episode count, or nil when the feed was parsed with a
+-- max_episodes cap -- recording a capped count would tell the user a
+-- thousand-episode show has fifteen. Taking a count rather than a feed is what
+-- lets a bulk refresh report counts without carrying every episode table back
+-- across a subprocess boundary.
+function Library:apply_refresh(url, info)
     local subscription = self:find(url)
     if not subscription then return end
+    info = info or {}
     subscription.last_refreshed = os.time()
-    if complete then subscription.episode_count = #feed.episodes end
-    if feed.channel.title then subscription.title = feed.channel.title end
-    subscription.author = subscription.author or feed.channel.author
-    subscription.image = subscription.image or feed.channel.image
+    if info.count then subscription.episode_count = info.count end
+    if info.title then subscription.title = info.title end
+    subscription.author = subscription.author or info.author
+    subscription.image = subscription.image or info.image
+end
+
+--- Convenience wrapper for callers that already hold a parsed feed.
+-- `complete` must be false when the parse was capped.
+function Library:record_refresh(url, feed, complete)
+    self:apply_refresh(url, {
+        title = feed.channel.title,
+        author = feed.channel.author,
+        image = feed.channel.image,
+        count = complete and #feed.episodes or nil,
+    })
 end
 
 --- Per-episode state, created on first access.

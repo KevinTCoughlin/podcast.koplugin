@@ -42,3 +42,16 @@ package:
     rm -f dist/podcast.koplugin.zip
     zip -qr dist/podcast.koplugin.zip podcast.koplugin -x '*.log'
     echo "dist/podcast.koplugin.zip"
+
+# Headless (SDL dummy driver), so it works over SSH and in CI.
+# Load the plugin into a real KOReader and assert every widget check passes
+emulator-smoke:
+    ./tools/emulator.sh smoke
+
+# Launch a real KOReader with the plugin installed, to click around
+emulator:
+    ./tools/emulator.sh run
+
+# Copy the plugin onto a Kobo mounted as USB mass storage
+install-kobo:
+    ./tools/install-kobo.sh

@@ -17,6 +17,14 @@
 - `bin/kopod` development harness, and 68 tests with no external dependencies.
 - `koaudio` vendored from shoutkit.koplugin via `git subtree`.
 
+- KOReader UI: Tools → Podcasts. Subscriptions list with add-by-URL,
+  refresh-all and unsubscribe; episode list showing download state, position
+  and show notes; now-playing with ±30 s seek and position persistence. Feeds
+  and downloads run in a dismissable subprocess, and cancelling a download
+  leaves the partial file it resumes from.
+- `tools/emulator.sh`: loads the plugin into a real KOReader release build and
+  drives its widgets headless (18 checks), plus `tools/install-kobo.sh`.
+
 ### Not yet
-- No KOReader UI: no `_meta.lua`, no `main.lua`. Deferred until the sibling
-  radio plugin's widget patterns are validated in the emulator.
+- Only the mpv audio backend exists, so playback does not work on any e-reader.
+  Everything else — subscribing, refreshing, downloading — does.
