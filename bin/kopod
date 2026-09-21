@@ -1,0 +1,251 @@
+#!/usr/bin/env luajit
+--[[--
+Development harness for podcast.koplugin.
+
+Drives the feed parser, the library and the shared playback core outside
+KOReader, so the whole subscribe → refresh → download → play path can be built
+and debugged on a desktop.
+
+    bin/kopod add https://feeds.npr.org/510289/podcast.xml
+    bin/kopod list
+    bin/kopod episodes 1
+    bin/kopod download 1 1
+    bin/kopod play 1 1 --seconds 20
+    bin/kopod resume 1 1
+
+State lives in $KOPOD_HOME (default ~/.kopod), not in KOReader's settings.
+Not shipped to devices.
+]]
+
+local here = arg[0]:match("^(.*)/bin/[^/]+$") or "."
+package.path = table.concat({
+    here .. "/podcast.koplugin/?.lua",
+    here .. "/podcast.koplugin/?/init.lua",
+    package.path,
+}, ";")
+
+local DateTime = require("feed.datetime")
+local Fetch = require("net.fetch")
+local Library = require("library")
+local Parser = require("feed.parser")
+local koaudio = require("koaudio")
+
+math.randomseed(os.time())
+
+local function die(message)
+    io.stderr:write("kopod: ", message, "\n")
+    os.exit(1)
+end
+
+local function parse_args(argv)
+    local flags, positional = {}, {}
+    local index = 1
+    while index <= #argv do
+        local key = argv[index]:match("^%-%-(.+)$")
+        if key then
+            local next_token = argv[index + 1]
+            if next_token and not next_token:match("^%-%-") then
+                flags[key] = next_token
+                index = index + 2
+            else
+                flags[key] = true
+                index = index + 1
+            end
+        else
+            positional[#positional + 1] = argv[index]
+            index = index + 1
+        end
+    end
+    return flags, positional
+end
+
+local flags, positional = parse_args({ select(2, unpack(arg, 0, #arg)) })
+local command = positional[1]
+
+local library = Library.new{}
+local fetch = Fetch.new(flags.transport, { user_agent = "podcast.koplugin-dev/0.1.0" })
+
+local function subscription_at(index)
+    local subscription = library:subscriptions()[tonumber(index) or 0]
+    if not subscription then die("no subscription " .. tostring(index)) end
+    return subscription
+end
+
+--- Fetches and parses a feed. `max` caps episodes, which keeps a 20 MB feed
+-- from being fully parsed just to list the latest few.
+local function load_feed(url, max)
+    local body, err = fetch:get(url, { timeout = 45 })
+    if not body then die("fetch failed: " .. tostring(err)) end
+    local feed, parse_err = Parser.parse(body, { max_episodes = max })
+    if not feed then die("parse failed: " .. tostring(parse_err)) end
+    return feed
+end
+
+local function episode_label(episode, index, downloaded, position)
+    local bits = {}
+    if episode.published then bits[#bits + 1] = os.date("!%Y-%m-%d", episode.published) end
+    local duration = DateTime.format_duration(episode.duration)
+    if duration then bits[#bits + 1] = duration end
+    if episode.size then bits[#bits + 1] = string.format("%.0f MB", episode.size / 1048576) end
+    if downloaded then bits[#bits + 1] = "downloaded" end
+    if position and position > 0 then
+        bits[#bits + 1] = "at " .. (DateTime.format_duration(position) or "0:00")
+    end
+    return string.format("%3d. %s\n     %s", index, episode.title, table.concat(bits, "  ·  "))
+end
+
+--- Plays a local file or a stream URL, tracking position so it can be resumed.
+-- `start_at` seeks once playback is actually running; seeking before the
+-- backend has opened the file is silently dropped.
+local function play_item(item, episode, start_at)
+    local player = koaudio.Player.new{ volume = tonumber(flags.volume) or 60 }
+    if not player:is_usable() then die(player:unavailable_reason()) end
+    print("backend: " .. tostring(player.backend_name))
+    print("playing: " .. tostring(item.title))
+
+    local last
+    player:subscribe(function(state, status)
+        local elapsed = tonumber(status.elapsed) or 0
+        local line = string.format("[%s] %s / %s", state,
+            DateTime.format_duration(elapsed) or "0:00",
+            DateTime.format_duration(tonumber(status.duration)) or "?")
+        if line ~= last then print(line); last = line end
+    end)
+
+    local ok, err = player:play(item)
+    if not ok then die(tostring(err)) end
+
+    local seeked = not (start_at and start_at > 5)
+    for _ = 1, tonumber(flags.seconds) or 30 do
+        os.execute("sleep 1")
+        local state = player:tick()
+        if not seeked and state == "playing" then
+            player.backend:seek_to(start_at)
+            print("resumed at " .. (DateTime.format_duration(start_at) or "0:00"))
+            seeked = true
+        end
+        local elapsed = tonumber(player.status.elapsed)
+        if episode and elapsed and elapsed > 0 then
+            library:set_position(episode, elapsed)
+        end
+        if state == "stopped" or state == "error" then break end
+    end
+    player:stop()
+    if episode then
+        library:save()
+        print(string.format("saved position: %s",
+            DateTime.format_duration(library:position(episode)) or "0:00"))
+    end
+end
+
+if command == "add" then
+    local url = positional[2] or die("usage: kopod add <feed-url>")
+    local feed = load_feed(url, 1)
+    local subscription, was_new = library:subscribe(url, feed.channel)
+    library:save()
+    print(string.format("%s: %s", was_new and "subscribed" or "already subscribed",
+        subscription.title))
+
+elseif command == "remove" then
+    local subscription = subscription_at(positional[2])
+    library:unsubscribe(subscription.url)
+    library:save()
+    print("removed: " .. subscription.title)
+
+elseif command == "list" then
+    local subscriptions = library:subscriptions()
+    if #subscriptions == 0 then print("no subscriptions; try: kopod add <feed-url>") end
+    for index, subscription in ipairs(subscriptions) do
+        print(string.format("%3d. %s", index, subscription.title))
+        print(string.format("     %s", subscription.url))
+        print(string.format("     %s episodes, refreshed %s",
+            subscription.episode_count or "?",
+            subscription.last_refreshed
+                and os.date("!%Y-%m-%d %H:%M", subscription.last_refreshed) or "never"))
+    end
+
+elseif command == "refresh" then
+    local targets = positional[2]
+        and { subscription_at(positional[2]) }
+        or library:subscriptions()
+    for _, subscription in ipairs(targets) do
+        local feed = load_feed(subscription.url)
+        library:record_refresh(subscription.url, feed, true)
+        print(string.format("%s: %d episodes", feed.channel.title, #feed.episodes))
+    end
+    library:save()
+
+elseif command == "episodes" then
+    local subscription = subscription_at(positional[2])
+    local feed = load_feed(subscription.url, tonumber(flags.limit) or 15)
+    print(feed.channel.title .. "\n")
+    for index, episode in ipairs(feed.episodes) do
+        print(episode_label(episode, index,
+            library:is_downloaded(episode), library:position(episode)))
+    end
+
+elseif command == "download" then
+    local subscription = subscription_at(positional[2])
+    local wanted = tonumber(positional[3]) or 1
+    local feed = load_feed(subscription.url, wanted)
+    local episode = feed.episodes[wanted] or die("no episode " .. wanted)
+
+    local path = library:episode_path(episode)
+    os.execute("mkdir -p '" .. library.download_dir:gsub("'", "'\\''") .. "'")
+    local already = Fetch.file_size(path)
+    if already > 0 then
+        print(string.format("resuming from %.1f MB", already / 1048576))
+    end
+    print("downloading: " .. episode.title)
+
+    local size, err = fetch:download(episode.url, path)
+    if err then
+        print(string.format("%s (%.1f MB on disk)", err, size / 1048576))
+        os.exit(1)
+    end
+    library:mark_downloaded(episode, path, size)
+    library:save()
+    print(string.format("saved %.1f MB to %s", size / 1048576, path))
+
+elseif command == "play" or command == "resume" then
+    local subscription = subscription_at(positional[2])
+    local wanted = tonumber(positional[3]) or 1
+    local feed = load_feed(subscription.url, wanted)
+    local episode = feed.episodes[wanted] or die("no episode " .. wanted)
+
+    local state = library:episode(episode.guid)
+    -- A downloaded episode plays from disk; anything else streams. Streaming is
+    -- the fallback, not the default: on an e-reader, downloading once and
+    -- playing with the radio off is the whole point.
+    local source = (state.path and Fetch.file_size(state.path) > 0)
+        and state.path or episode.url
+    print(source == episode.url and "streaming (not downloaded)" or "playing local file")
+
+    -- `play` starts over; `resume` picks up where the saved position left off.
+    local start_at = (command == "resume") and library:position(episode) or nil
+
+    play_item({
+        url = source,
+        title = episode.title,
+        kind = "file",
+    }, episode, start_at)
+
+elseif command == "parse" then
+    -- Offline: parse a file that is already on disk. Useful for a feed that
+    -- misbehaves, without re-fetching it every time.
+    local path = positional[2] or die("usage: kopod parse <file.xml>")
+    local handle = io.open(path) or die("cannot read " .. path)
+    local body = handle:read("*a")
+    handle:close()
+    local feed, err = Parser.parse(body, { max_episodes = tonumber(flags.limit) })
+    if not feed then die(tostring(err)) end
+    print(string.format("%s -- %d episodes", feed.channel.title, #feed.episodes))
+    for index, episode in ipairs(feed.episodes) do
+        print(episode_label(episode, index, false, 0))
+    end
+
+else
+    print("usage: kopod <add|remove|list|refresh|episodes|download|play|resume|parse> [args]")
+    print("flags: --limit N --seconds N --volume 0-100 --transport curl|koreader")
+    os.exit(command and 1 or 0)
+end
