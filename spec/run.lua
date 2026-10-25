@@ -20,8 +20,10 @@ assert_ = Runner.assert
 local specs = {
     "xml_spec",
     "datetime_spec",
+    "url_spec",
     "parser_spec",
     "library_spec",
+    "fetch_spec",
 }
 
 for _, spec in ipairs(specs) do

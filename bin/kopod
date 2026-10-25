@@ -73,11 +73,28 @@ end
 
 --- Fetches and parses a feed. `max` caps episodes, which keeps a 20 MB feed
 -- from being fully parsed just to list the latest few.
-local function load_feed(url, max)
-    local body, err = fetch:get(url, { timeout = 45 })
+-- A permanent redirect renames the subscription as a side effect, so the
+-- returned feed's episodes carry the URL their state is now keyed by.
+local function load_feed(url, max, discovered_from)
+    local body, err, _, info = fetch:get(url, { timeout = 45 })
     if not body then die("fetch failed: " .. tostring(err)) end
-    local feed, parse_err = Parser.parse(body, { max_episodes = max })
-    if not feed then die("parse failed: " .. tostring(parse_err)) end
+    if info.moved_to and library:find(url) then
+        library:rename_feed(url, info.moved_to)
+        library:save()
+        print("moved permanently: " .. info.moved_to)
+    end
+    local feed_url = info.moved_to or url
+    local feed, parse_err = Parser.parse(body, {
+        max_episodes = max, base_url = info.url, feed_url = feed_url,
+    })
+    if not feed then
+        -- A web page rather than a feed: try the feed it advertises.
+        local discovered = not discovered_from and Parser.discover(body, info.url)
+        if not discovered then die("parse failed: " .. tostring(parse_err)) end
+        print("discovered feed: " .. discovered)
+        return load_feed(discovered, max, url)
+    end
+    feed.url = feed_url
     return feed
 end
 
@@ -141,7 +158,7 @@ end
 if command == "add" then
     local url = positional[2] or die("usage: kopod add <feed-url>")
     local feed = load_feed(url, 1)
-    local subscription, was_new = library:subscribe(url, feed.channel)
+    local subscription, was_new = library:subscribe(feed.url, feed.channel)
     library:save()
     print(string.format("%s: %s", was_new and "subscribed" or "already subscribed",
         subscription.title))
@@ -168,10 +185,35 @@ elseif command == "refresh" then
     local targets = positional[2]
         and { subscription_at(positional[2]) }
         or library:subscriptions()
-    for _, subscription in ipairs(targets) do
-        local feed = load_feed(subscription.url)
-        library:record_refresh(subscription.url, feed, true)
-        print(string.format("%s: %d episodes", feed.channel.title, #feed.episodes))
+    local snapshot = {}
+    for index, subscription in ipairs(targets) do snapshot[index] = subscription end
+    for _, subscription in ipairs(snapshot) do
+        local url = subscription.url
+        local body, err, _, info = fetch:get(url, {
+            timeout = 45, etag = subscription.etag, last_modified = subscription.last_modified,
+        })
+        if err == Fetch.NOT_MODIFIED then
+            library:apply_refresh(url, { not_modified = true, moved_to = info.moved_to,
+                validators = true, etag = info.etag or subscription.etag,
+                last_modified = info.last_modified or subscription.last_modified })
+            print(string.format("%s: not modified", subscription.title))
+        elseif not body then
+            print(string.format("%s: %s", subscription.title, tostring(err)))
+        else
+            local feed, parse_err = Parser.parse(body, { base_url = info.url })
+            if feed then
+                library:apply_refresh(url, {
+                    title = feed.channel.title, author = feed.channel.author,
+                    image = feed.channel.image, count = #feed.episodes,
+                    moved_to = info.moved_to, validators = true,
+                    etag = info.etag, last_modified = info.last_modified,
+                })
+                print(string.format("%s: %d episodes", feed.channel.title, #feed.episodes))
+            else
+                print(string.format("%s: %s", subscription.title, tostring(parse_err)))
+            end
+        end
+        if info and info.moved_to then print("  moved permanently: " .. info.moved_to) end
     end
     library:save()
 
@@ -213,7 +255,7 @@ elseif command == "play" or command == "resume" then
     local feed = load_feed(subscription.url, wanted)
     local episode = feed.episodes[wanted] or die("no episode " .. wanted)
 
-    local state = library:episode(episode.guid)
+    local state = library:episode(episode)
     -- A downloaded episode plays from disk; anything else streams. Streaming is
     -- the fallback, not the default: on an e-reader, downloading once and
     -- playing with the radio off is the whole point.

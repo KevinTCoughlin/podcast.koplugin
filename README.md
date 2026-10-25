@@ -13,7 +13,7 @@ A GitHub search for a KOReader podcast plugin returns nothing. So: this.
 
 > **Status: early, but it runs as a KOReader plugin.** Subscribe, refresh,
 > browse episodes, download and play — all working and verified against a real
-> KOReader build (`just emulator-smoke`, 18 checks including a live 2.1 MB feed
+> KOReader build (`just emulator-smoke`, 19 checks including a live 2.1 MB feed
 > and a real download through KOReader's own luasec). The gap is **audio
 > backends**: only mpv is implemented, so on an actual e-reader everything
 > except playback works. See [ROADMAP.md](ROADMAP.md).
@@ -81,8 +81,8 @@ tables is how you get an OOM kill. `feed/xml.lua` emits a flat event stream and
 
 **Episode state lives apart from the feed.** A refresh replaces the episode
 list wholesale. What must survive it is the part the user created: played,
-position, downloaded. Keyed by guid, stored separately, and there is a test
-pinning exactly that.
+position, downloaded. Keyed by feed URL and guid (a guid is only unique within
+its feed), stored separately, and there is a test pinning exactly that.
 
 **Every download resumes.** Episodes are tens to hundreds of megabytes over
 Wi-Fi that drops, on a device that powers its radio down aggressively.
@@ -109,7 +109,7 @@ Needs `luajit` and `mpv`. No luarocks, no KOReader checkout.
 ```sh
 just test              # 68 unit tests, dependency-free runner
 just check             # syntax-check every Lua file
-just emulator-smoke    # load into real KOReader, assert 18 widget checks
+just emulator-smoke    # load into real KOReader, assert 19 widget checks
 just emulator          # launch real KOReader to click around (Tools -> Podcasts)
 just cli list
 just install-kobo      # copy onto a Kobo mounted as USB mass storage

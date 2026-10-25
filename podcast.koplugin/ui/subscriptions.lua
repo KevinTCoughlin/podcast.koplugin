@@ -195,12 +195,24 @@ function Subscriptions:_subscribe(url)
             local completed, result = Trapper:dismissableRunInSubprocess(function()
                 local ChildFetch = require("net.fetch")
                 local ChildParser = require("feed.parser")
-                local body, err = ChildFetch.new(fetch_kind, { user_agent = user_agent })
-                    :get(url, { timeout = 45 })
+                local fetch = ChildFetch.new(fetch_kind, { user_agent = user_agent })
+                local body, err, _code, info = fetch:get(url, { timeout = 45 })
                 if not body then return { error = tostring(err) } end
-                local feed, parse_err = ChildParser.parse(body, { max_episodes = 1 })
-                if not feed then return { error = tostring(parse_err) } end
-                return { channel = feed.channel, episodes = #feed.episodes }
+                local feed, parse_err = ChildParser.parse(body, { max_episodes = 1, base_url = info.url })
+                if not feed then
+                    -- A show's web page rather than its feed: follow the feed
+                    -- the page advertises, if it advertises one.
+                    local discovered = ChildParser.discover(body, info.url)
+                    if not discovered then return { error = tostring(parse_err) } end
+                    body, err, _code, info = fetch:get(discovered, { timeout = 45 })
+                    if not body then return { error = tostring(err) } end
+                    feed, parse_err = ChildParser.parse(body, { max_episodes = 1, base_url = info.url })
+                    if not feed then return { error = tostring(parse_err) } end
+                    return { channel = feed.channel, episodes = #feed.episodes,
+                        url = info.moved_to or discovered }
+                end
+                return { channel = feed.channel, episodes = #feed.episodes,
+                    url = info.moved_to or url }
             end, _("Checking the feed…\n\nTap to cancel."))
 
             if not completed then return end
@@ -215,7 +227,7 @@ function Subscriptions:_subscribe(url)
                 return
             end
 
-            local subscription, was_new = self.library:subscribe(url, result.channel)
+            local subscription, was_new = self.library:subscribe(result.url or url, result.channel)
             self.library:save()
             UIManager:show(InfoMessage:new{
                 text = (was_new and _("Subscribed to ") or _("Already subscribed to ")) ..
@@ -236,9 +248,10 @@ function Subscriptions:refresh_all()
         return
     end
 
-    local urls = {}
+    local urls, validators = {}, {}
     for _index, subscription in ipairs(subscriptions) do
         urls[#urls + 1] = subscription.url
+        validators[subscription.url] = self.library:validators(subscription.url)
     end
     local fetch_kind = self.fetch.kind
     local user_agent = self.user_agent
@@ -251,17 +264,32 @@ function Subscriptions:refresh_all()
                 local fetch = ChildFetch.new(fetch_kind, { user_agent = user_agent })
                 local out = {}
                 for _index, url in ipairs(urls) do
-                    local body = fetch:get(url, { timeout = 45 })
-                    local feed = body and ChildParser.parse(body)
-                    -- A feed that fails is skipped, not fatal: one dead show
-                    -- must not block refreshing the rest.
-                    if feed then
-                        out[url] = {
-                            title = feed.channel.title,
-                            author = feed.channel.author,
-                            image = feed.channel.image,
-                            count = #feed.episodes,
-                        }
+                    -- Conditional: an unchanged feed is a 304 with no body,
+                    -- which is most feeds on most refreshes.
+                    local known = validators[url] or {}
+                    local body, err, _code, info = fetch:get(url, {
+                        timeout = 45, etag = known.etag, last_modified = known.last_modified,
+                    })
+                    if err == ChildFetch.NOT_MODIFIED then
+                        out[url] = { not_modified = true, moved_to = info and info.moved_to,
+                            validators = true, etag = info and info.etag or known.etag,
+                            last_modified = info and info.last_modified or known.last_modified }
+                    else
+                        local feed = body and ChildParser.parse(body, { base_url = info.url })
+                        -- A feed that fails is skipped, not fatal: one dead show
+                        -- must not block refreshing the rest.
+                        if feed then
+                            out[url] = {
+                                title = feed.channel.title,
+                                author = feed.channel.author,
+                                image = feed.channel.image,
+                                count = #feed.episodes,
+                                moved_to = info.moved_to,
+                                validators = true,
+                                etag = info.etag,
+                                last_modified = info.last_modified,
+                            }
+                        end
                     end
                 end
                 return out
@@ -270,7 +298,10 @@ function Subscriptions:refresh_all()
             if not completed then return end
 
             local refreshed, failed = 0, 0
-            for _index, subscription in ipairs(subscriptions) do
+            -- A copy: apply_refresh can rename or merge subscriptions.
+            local snapshot = {}
+            for index, subscription in ipairs(subscriptions) do snapshot[index] = subscription end
+            for _index, subscription in ipairs(snapshot) do
                 local result = results and results[subscription.url]
                 if result then
                     self.library:apply_refresh(subscription.url, result)

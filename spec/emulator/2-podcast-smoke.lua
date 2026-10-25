@@ -247,6 +247,16 @@ UIManager:scheduleIn(1, function()
         end
     end, true)
 
+    -- luasocket cannot follow a redirect across schemes on its own, so this is
+    -- the manual redirect loop against a real 301, through both clients.
+    step("an http -> https permanent redirect through luasocket", function()
+        local http_url = FEED_URL:gsub("^https:", "http:")
+        local body, err, _code, info = Fetch.new("koreader"):get(http_url, { timeout = 45 })
+        assert(body, "redirected request failed: " .. tostring(err))
+        assert(info.url == FEED_URL, "ended at " .. tostring(info.url))
+        assert(info.moved_to == FEED_URL, "moved_to was " .. tostring(info.moved_to))
+    end, true)
+
     step("resumable download over KOReader's HTTP stack", function()
         local DataStorage = require("datastorage")
         local path = DataStorage:getDataDir() .. "/podcast-smoke.bin"

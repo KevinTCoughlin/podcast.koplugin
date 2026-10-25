@@ -22,7 +22,7 @@ Written after shoutkit.koplugin's UI was validated in the emulator, so the
 - [x] Now-playing with ±30 s seek and position persistence
 - [x] Feeds and downloads in a dismissable subprocess; cancelling a download
       leaves the partial file it resumes from
-- [x] `just emulator-smoke`: 18 checks inside a real KOReader build, including
+- [x] `just emulator-smoke`: 19 checks inside a real KOReader build, including
       a live feed and a real download through KOReader's own luasec
 - [ ] A real scrubber rather than ±30 s buttons
 - [ ] Download queue and a "download on next connect" mode — an e-reader is
