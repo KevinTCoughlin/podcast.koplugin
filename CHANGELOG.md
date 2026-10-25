@@ -25,6 +25,25 @@
 - `tools/emulator.sh`: loads the plugin into a real KOReader release build and
   drives its widgets headless (18 checks), plus `tools/install-kobo.sh`.
 
+- Polite feed fetching, per https://kevincox.ca/2022/05/06/rss-feed-best-practices/:
+  - Conditional requests. Refresh-all and `kopod refresh` send the stored
+    `ETag`/`Last-Modified` as `If-None-Match`/`If-Modified-Since`; a 304 keeps
+    the subscription as it was without downloading or parsing the feed.
+  - Redirects on the luasocket path, which could not follow http → https.
+    Both paths follow up to 10 hops, and when every hop is permanent (301/308)
+    the subscription moves to the new URL, episode state included.
+  - Relative enclosure, link and artwork URLs are resolved against the feed
+    URL and Atom `xml:base` (`feed/url.lua`, an RFC 3986 resolver).
+  - Adding a show's web page finds the feed it advertises with
+    `<link rel="alternate" type="application/rss+xml">` (or Atom).
+  - `content:encoded` and Atom `content` are used as show notes when richer
+    than the description, and a future publication date is clamped to now.
+
+### Changed
+- Episode state is keyed by feed URL and guid, since a guid is only unique
+  within its feed. Existing guid-only state migrates to the first feed that
+  asks for it. Download file names gain a short per-feed prefix.
+
 ### Not yet
 - Only the mpv audio backend exists, so playback does not work on any e-reader.
   Everything else — subscribing, refreshing, downloading — does.

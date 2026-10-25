@@ -237,3 +237,147 @@ describe("Parser.strip_html", function()
         assert_.nil_(Parser.strip_html("<p></p>"))
     end)
 end)
+
+describe("Parser.parse relative URLs", function()
+    local FEED = "https://example.org/shows/feed.xml"
+
+    it("resolves enclosure, link and artwork against the feed URL", function()
+        local feed = Parser.parse(rss([[
+            <link>/shows/</link>
+            <itunes:image href="art/cover.png"/>
+        ]], [[
+            <item><guid>a</guid><link>ep1.html</link>
+              <itunes:image href="/img/ep1.png"/>
+              <enclosure url="audio/ep1.mp3" type="audio/mpeg"/></item>
+        ]]), { base_url = FEED })
+        assert_.equal("https://example.org/shows/", feed.channel.page_url)
+        assert_.equal("https://example.org/shows/art/cover.png", feed.channel.image)
+        local episode = feed.episodes[1]
+        assert_.equal("https://example.org/shows/audio/ep1.mp3", episode.url)
+        assert_.equal("https://example.org/shows/ep1.html", episode.page_url)
+        assert_.equal("https://example.org/img/ep1.png", episode.image)
+    end)
+
+    it("resolves the channel <image><url>", function()
+        local feed = Parser.parse(rss("<image><url>logo.png</url></image>", FULL_ITEM),
+            { base_url = FEED })
+        assert_.equal("https://example.org/shows/logo.png", feed.channel.image)
+    end)
+
+    it("resolves media:content too", function()
+        local feed = Parser.parse(rss(nil, [[
+            <item><guid>a</guid><media:content url="m.mp3" type="audio/mpeg"/></item>
+        ]]), { base_url = FEED })
+        assert_.equal("https://example.org/shows/m.mp3", feed.episodes[1].url)
+    end)
+
+    it("leaves absolute URLs untouched", function()
+        local feed = Parser.parse(rss(nil, FULL_ITEM), { base_url = FEED })
+        assert_.equal("https://example.org/ep1.mp3", feed.episodes[1].url)
+    end)
+
+    it("honours a nested Atom xml:base, and only inside its element", function()
+        local feed = Parser.parse([[
+            <feed xmlns="http://www.w3.org/2005/Atom" xml:base="https://cdn.example.org/podcast/">
+              <title>Based</title>
+              <link href="home"/>
+              <entry xml:base="2026/">
+                <id>one</id>
+                <link rel="enclosure" type="audio/mpeg" href="one.mp3"/>
+                <link rel="alternate" href="/pages/one"/>
+              </entry>
+              <entry>
+                <id>two</id>
+                <link rel="enclosure" type="audio/mpeg" href="two.mp3"/>
+              </entry>
+            </feed>
+        ]], { base_url = FEED })
+        assert_.equal("https://cdn.example.org/podcast/home", feed.channel.page_url)
+        assert_.equal("https://cdn.example.org/podcast/2026/one.mp3", feed.episodes[1].url)
+        assert_.equal("https://cdn.example.org/pages/one", feed.episodes[1].page_url)
+        assert_.equal("https://cdn.example.org/podcast/two.mp3", feed.episodes[2].url)
+    end)
+
+    it("stamps each episode with its feed, defaulting to the base URL", function()
+        assert_.equal(FEED, Parser.parse(rss(nil, FULL_ITEM), { base_url = FEED })
+            .episodes[1].feed_url)
+        assert_.equal("https://old.example.org/feed", Parser.parse(rss(nil, FULL_ITEM),
+            { base_url = FEED, feed_url = "https://old.example.org/feed" }).episodes[1].feed_url)
+    end)
+end)
+
+describe("Parser.parse show notes and dates", function()
+    it("prefers content:encoded when it is richer than description", function()
+        local feed = Parser.parse(rss(nil, [==[
+            <item><guid>a</guid><description>Short teaser.</description>
+              <content:encoded><![CDATA[<p>Full notes, with <a href="x">links</a> and more.</p>]]></content:encoded>
+              <enclosure url="http://x/a.mp3" type="audio/mpeg"/></item>
+        ]==]))
+        assert_.equal("Full notes, with links and more.", feed.episodes[1].description)
+    end)
+
+    it("keeps description when content:encoded is no richer", function()
+        local feed = Parser.parse(rss(nil, [[
+            <item><guid>a</guid><description>The full description here.</description>
+              <content:encoded>Short</content:encoded>
+              <enclosure url="http://x/a.mp3" type="audio/mpeg"/></item>
+        ]]))
+        assert_.equal("The full description here.", feed.episodes[1].description)
+    end)
+
+    it("uses Atom content over a shorter summary", function()
+        local feed = Parser.parse([[
+            <feed xmlns="http://www.w3.org/2005/Atom"><title>A</title>
+              <entry><id>1</id><summary>Brief</summary>
+                <content type="html">&lt;p&gt;The long-form &amp;amp; complete notes&lt;/p&gt;</content>
+                <link rel="enclosure" type="audio/mpeg" href="https://x/a.mp3"/></entry>
+            </feed>
+        ]])
+        assert_.equal("The long-form & complete notes", feed.episodes[1].description)
+    end)
+
+    it("clamps a future publication date to now", function()
+        local now = 1768452474   -- 2026-01-15T04:47:54Z
+        local feed = Parser.parse(rss(nil, [[
+            <item><guid>future</guid><pubDate>Fri, 01 Jan 2100 00:00:00 +0000</pubDate>
+              <enclosure url="http://x/f.mp3" type="audio/mpeg"/></item>
+            <item><guid>past</guid><pubDate>Mon, 12 Jan 2026 00:00:00 +0000</pubDate>
+              <enclosure url="http://x/p.mp3" type="audio/mpeg"/></item>
+        ]]), { now = now })
+        assert_.equal(now, feed.episodes[1].published)
+        assert_.equal("Fri, 01 Jan 2100 00:00:00 +0000", feed.episodes[1].published_raw)
+        assert_.truthy(feed.episodes[2].published < now)
+    end)
+end)
+
+describe("Parser.discover", function()
+    local PAGE = "https://example.org/show/"
+
+    it("finds the first advertised feed and resolves it", function()
+        local html = [[
+            <html><head>
+              <link rel="stylesheet" href="/s.css">
+              <link rel="alternate" type="text/html" href="/other">
+              <LINK REL="alternate" TYPE="application/rss+xml" title="Podcast" HREF="feed.xml?a=1&amp;b=2">
+              <link rel="alternate" type="application/atom+xml" href="/atom.xml">
+            </head></html>
+        ]]
+        assert_.equal("https://example.org/show/feed.xml?a=1&b=2", Parser.discover(html, PAGE))
+    end)
+
+    it("accepts Atom, unquoted attributes and multi-token rel", function()
+        local html = [[<head><link type=application/atom+xml rel="feed alternate" href=/a.xml /></head>]]
+        assert_.equal("https://example.org/a.xml", Parser.discover(html, PAGE))
+    end)
+
+    it("honours <base href>", function()
+        local html = [[<head><base href="https://cdn.example.org/x/">
+            <link rel="alternate" type="application/rss+xml" href="rss"></head>]]
+        assert_.equal("https://cdn.example.org/x/rss", Parser.discover(html, PAGE))
+    end)
+
+    it("returns nil when the page advertises no feed", function()
+        assert_.nil_(Parser.discover("<html><head><title>x</title></head></html>", PAGE))
+        assert_.nil_(Parser.discover(nil, PAGE))
+    end)
+end)

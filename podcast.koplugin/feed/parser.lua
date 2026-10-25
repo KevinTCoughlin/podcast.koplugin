@@ -18,6 +18,7 @@ thousand episodes is processed one event at a time and never held as a tree.
 ]]
 
 local DateTime = require("feed.datetime")
+local Url = require("feed.url")
 local Xml = require("feed.xml")
 
 local Parser = {}
@@ -56,6 +57,10 @@ local ITEM_TEXT_FIELDS = {
     ["updated"] = "updated_raw",            -- Atom
     ["description"] = "description",
     ["summary"] = "description",
+    -- Full show notes. Often far richer than <description>, which some
+    -- publishers fill with a one-line teaser.
+    ["content:encoded"] = "content",
+    ["content"] = "content",               -- Atom
     ["itunes:summary"] = "itunes_summary",
     ["itunes:subtitle"] = "subtitle",
     ["itunes:duration"] = "duration_raw",
@@ -97,19 +102,29 @@ function Parser.strip_html(text)
     return trim((stripped:gsub("[ \t]+", " "):gsub("\n%s*\n%s*\n+", "\n\n")))
 end
 
-local function finish_episode(raw)
+local function finish_episode(raw, opts)
     if not raw.url then return nil end
 
     local duration = DateTime.parse_duration(raw.duration_raw)
     local published = DateTime.parse(raw.published_raw)
         or DateTime.parse(raw.updated_raw)
+    -- A date in the future is a publisher's mistake (or a scheduled post
+    -- leaking early), and taken literally it pins that episode to the top of
+    -- any newest-first list until the date passes. Treat it as "now".
+    local now = opts.now or os.time()
+    if published and published > now then published = now end
 
-    local description = raw.description or raw.itunes_summary
+    local description = Parser.strip_html(raw.description or raw.itunes_summary)
+    local content = Parser.strip_html(raw.content)
+    if content and #content > #(description or "") then description = content end
 
     return {
         -- A feed without guids is not unheard of; the enclosure URL is the
         -- next-best stable identity, and is what dedupes a refresh.
         guid = raw.guid or raw.url,
+        -- Which feed this came from. Library keys episode state by feed and
+        -- guid together, because a guid is only unique within its feed.
+        feed_url = opts.feed_url,
         title = raw.title or "(untitled episode)",
         url = raw.url,
         mime = raw.mime,
@@ -120,7 +135,7 @@ local function finish_episode(raw)
         published = published,
         published_raw = raw.published_raw,
         subtitle = trim(raw.subtitle),
-        description = Parser.strip_html(description),
+        description = description,
         episode_number = tonumber(raw.episode_number),
         season = tonumber(raw.season),
         explicit = (raw.explicit or ""):lower() == "yes" or raw.explicit == "true",
@@ -136,6 +151,11 @@ end
 -- `opts.max_episodes` stops after that many episodes. Feeds are ordered
 -- newest-first by convention, so this is a cheap way to avoid parsing ten
 -- years of back catalogue on a slow device.
+--
+-- `opts.base_url` is the URL the document was actually fetched from (after
+-- redirects); relative URLs in the feed are resolved against it, or against an
+-- `xml:base` in scope. `opts.feed_url` is the subscription's URL, stamped onto
+-- each episode as its identity; it defaults to `base_url`.
 function Parser.parse(document, opts)
     opts = opts or {}
     if type(document) ~= "string" or not document:find("<", 1, true) then
@@ -153,9 +173,26 @@ function Parser.parse(document, opts)
     local text_chunks = nil
     local depth_in_item = 0
     local saw_feed_root = false
+    local episode_opts = { feed_url = opts.feed_url or opts.base_url, now = opts.now }
+
+    -- xml:base scoping. One entry per open element, carrying the base in
+    -- force inside it. Feeds are not always well-formed (show notes with a bare
+    -- <br>), so a close pops back to its matching open rather than trusting
+    -- that the nesting is balanced.
+    local bases = { { base = opts.base_url } }
+    local function base() return bases[#bases].base end
+    local function absolute(reference) return Url.resolve(base(), reference) end
 
     for event in Xml.events(document) do
         local name = event.name
+
+        if event.type == "open" then
+            local declared = event.attrs["xml:base"]
+            bases[#bases + 1] = {
+                name = name,
+                base = declared and Url.resolve(base(), declared) or base(),
+            }
+        end
 
         if event.type == "open" then
             if name == "rss" or name == "feed" or name == "rdf:rdf" then
@@ -169,7 +206,7 @@ function Parser.parse(document, opts)
                 -- RSS: <enclosure url type length/>
                 local attrs = event.attrs
                 if item and looks_like_audio(attrs.url, attrs.type) then
-                    item.url = attrs.url
+                    item.url = absolute(attrs.url)
                     item.mime = attrs.type
                     item.length = attrs.length
                 end
@@ -178,7 +215,7 @@ function Parser.parse(document, opts)
                 -- Some feeds carry the audio only as Media RSS.
                 local attrs = event.attrs
                 if item and not item.url and looks_like_audio(attrs.url, attrs.type) then
-                    item.url = attrs.url
+                    item.url = absolute(attrs.url)
                     item.mime = attrs.type
                     item.length = attrs.filesize
                 end
@@ -190,22 +227,22 @@ function Parser.parse(document, opts)
                 if attrs.href then
                     if attrs.rel == "enclosure" then
                         if item and looks_like_audio(attrs.href, attrs.type) then
-                            item.url = attrs.href
+                            item.url = absolute(attrs.href)
                             item.mime = attrs.type
                             item.length = attrs.length
                         end
                     elseif not attrs.rel or attrs.rel == "alternate" then
                         if item then
-                            item.page_url = item.page_url or attrs.href
+                            item.page_url = item.page_url or absolute(attrs.href)
                         else
-                            channel.page_url = channel.page_url or attrs.href
+                            channel.page_url = channel.page_url or absolute(attrs.href)
                         end
                     end
                 end
                 current_tag, text_chunks = name, {}
 
             elseif name == "itunes:image" then
-                local href = event.attrs.href
+                local href = absolute(event.attrs.href)
                 if href then
                     if item then item.image = item.image or href
                     else channel.image = channel.image or href end
@@ -226,7 +263,7 @@ function Parser.parse(document, opts)
 
         elseif event.type == "close" then
             if name == "item" or name == "entry" then
-                local episode = finish_episode(item or {})
+                local episode = finish_episode(item or {}, episode_opts)
                 if episode then episodes[#episodes + 1] = episode end
                 item = nil
                 if opts.max_episodes and #episodes >= opts.max_episodes then
@@ -239,14 +276,16 @@ function Parser.parse(document, opts)
                 if text then
                     if item then
                         local field = ITEM_TEXT_FIELDS[name]
+                        if field == "page_url" then text = absolute(text) end
                         -- Never overwrite: the first occurrence wins, which
                         -- matters for feeds that repeat <link>.
                         if field and not item[field] then item[field] = text end
                     else
                         if current_tag == "image_url" then
-                            channel.image = channel.image or text
+                            channel.image = channel.image or absolute(text)
                         else
                             local field = CHANNEL_TEXT_FIELDS[name]
+                            if field == "page_url" then text = absolute(text) end
                             if field and not channel[field] then channel[field] = text end
                         end
                     end
@@ -255,6 +294,13 @@ function Parser.parse(document, opts)
             end
 
             if item then depth_in_item = depth_in_item - 1 end
+
+            for index = #bases, 2, -1 do
+                if bases[index].name == name then
+                    for drop = #bases, index, -1 do bases[drop] = nil end
+                    break
+                end
+            end
         end
     end
 
@@ -266,6 +312,57 @@ function Parser.parse(document, opts)
     channel.description = Parser.strip_html(channel.description or channel.summary)
 
     return { channel = channel, episodes = episodes }
+end
+
+local FEED_TYPES = {
+    ["application/rss+xml"] = true,
+    ["application/atom+xml"] = true,
+}
+
+--- HTML attributes, which unlike XML may be unquoted.
+local function html_attributes(source)
+    local attrs = {}
+    local position = 1
+    while true do
+        local name_start, name_end, name = source:find("([%w:_%-]+)%s*=%s*", position)
+        if not name_start then break end
+        local value
+        local quote = source:sub(name_end + 1, name_end + 1)
+        if quote == '"' or quote == "'" then
+            local close = source:find(quote, name_end + 2, true)
+            value = source:sub(name_end + 2, (close or #source + 1) - 1)
+            position = (close or #source) + 1
+        else
+            value = source:match("^[^%s>]+", name_end + 1) or ""
+            position = name_end + 1 + #value
+        end
+        attrs[name:lower()] = Xml.decode_entities(value)
+    end
+    return attrs
+end
+
+--- Finds the feed a web page advertises, for when someone pastes a show's
+-- home page rather than its feed. Returns the first
+-- `<link rel="alternate" type="application/rss+xml|atom+xml" href>`, resolved
+-- against `base_url` (or the page's own `<base href>`), or nil.
+function Parser.discover(html, base_url)
+    if type(html) ~= "string" then return nil end
+    local base = base_url
+    local base_tag = html:match("<[Bb][Aa][Ss][Ee]%s([^>]*)>")
+    if base_tag then
+        local href = html_attributes(base_tag).href
+        if href then base = Url.resolve(base_url, href) end
+    end
+    for tag in html:gmatch("<[Ll][Ii][Nn][Kk]%s([^>]*)>") do
+        local attrs = html_attributes(tag)
+        local rel = " " .. (attrs.rel or ""):lower():gsub("%s+", " ") .. " "
+        local mime = (attrs.type or ""):lower():gsub("^%s+", ""):gsub("%s*;.*$", ""):gsub("%s+$", "")
+        if rel:find(" alternate ", 1, true) and FEED_TYPES[mime] and attrs.href
+            and attrs.href:find("%S") then
+            return Url.resolve(base, attrs.href)
+        end
+    end
+    return nil
 end
 
 return Parser

@@ -13,12 +13,86 @@ module as a plain API client:
 
 Same two-implementation seam as the radio plugin's transport: curl for
 development and CI, luasocket for on-device. Tests inject a fake.
+
+`get` is a polite feed reader (https://kevincox.ca/2022/05/06/rss-feed-best-practices/):
+
+  * **Conditional requests.** Pass the `etag` and `last_modified` a previous
+    fetch returned, and an unchanged feed costs a 304 with no body instead of
+    megabytes. That comes back as `nil, Fetch.NOT_MODIFIED, 304, info`.
+  * **Redirects, and remembering them.** Both paths follow up to
+    MAX_REDIRECTS hops. When every hop was permanent (301/308), `info.moved_to`
+    is the new URL, and the caller should update the subscription so the old
+    one can eventually be retired by its publisher.
+
+The full return is `body, err, code, info`, with `info` holding `url` (where the
+body actually came from), `moved_to`, `etag` and `last_modified`.
 ]]
+
+local Url = require("feed.url")
 
 local Fetch = {}
 Fetch.__index = Fetch
 
 local DEFAULT_TIMEOUT = 30
+local MAX_REDIRECTS = 10
+
+--- Distinct from every other error string, so callers can compare against it.
+Fetch.NOT_MODIFIED = "not modified"
+
+local REDIRECT_CODES = { [301] = true, [302] = true, [303] = true, [307] = true, [308] = true }
+local PERMANENT_CODES = { [301] = true, [308] = true }
+
+--- Header values go on a command line and into a request; a stored validator
+-- with a line break in it must not be able to inject a header.
+local function header_value(value)
+    if value == nil then return nil end
+    value = tostring(value):gsub("[\r\n]", "")
+    if value == "" then return nil end
+    return value
+end
+
+local function conditional_headers(headers, opts)
+    headers["If-None-Match"] = header_value(opts.etag)
+    headers["If-Modified-Since"] = header_value(opts.last_modified)
+    return headers
+end
+
+--- The URL a redirect chain should be remembered as, or nil: only when every
+-- hop was permanent, and the chain actually went somewhere else.
+local function permanent_target(original, hops, final)
+    if #hops == 0 or final == original then return nil end
+    for _, code in ipairs(hops) do
+        if not PERMANENT_CODES[code] then return nil end
+    end
+    return final
+end
+
+--- The common tail of both `get` implementations.
+local function finish_get(code, body, info)
+    if code == 304 then return nil, Fetch.NOT_MODIFIED, code, info end
+    if code < 200 or code >= 300 then return nil, "HTTP " .. code, code, info end
+    return body, nil, code, info
+end
+
+--- Parses `curl -D` output: one block per response, redirects included.
+-- Returns a list of { code =, headers = { lowercase-name = value } }.
+-- Interim 1xx responses are dropped; they say nothing about the result.
+function Fetch.parse_header_dump(text)
+    local responses = {}
+    local current
+    for line in ((text or "") .. "\n"):gmatch("([^\n]*)\n") do
+        line = line:gsub("\r$", "")
+        local code = line:match("^HTTP/[%d%.]+%s+(%d%d%d)")
+        if code then
+            current = { code = tonumber(code), headers = {} }
+            if current.code >= 200 then responses[#responses + 1] = current end
+        elseif current then
+            local name, value = line:match("^([^:%s]+):%s*(.-)%s*$")
+            if name then current.headers[name:lower()] = value end
+        end
+    end
+    return responses
+end
 
 local function shell_escape(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -37,14 +111,22 @@ CurlFetch.__index = CurlFetch
 
 function CurlFetch:get(url, opts)
     opts = opts or {}
-    local body_path = (os.getenv("TMPDIR") or "/tmp") .. "/kopod-" .. tostring(math.random(1e9))
+    local temp = (os.getenv("TMPDIR") or "/tmp") .. "/kopod-" .. tostring(math.random(1e9))
+    local body_path, header_path = temp, temp .. ".headers"
     local parts = {
-        "curl", "-sS", "-L",
+        "curl", "-sS", "-L", "--max-redirs", tostring(MAX_REDIRECTS),
         "--max-time", tostring(opts.timeout or DEFAULT_TIMEOUT),
         "-A", shell_escape(self.user_agent),
         "-o", shell_escape(body_path),
-        "-w", "'%{http_code}'",
+        -- Every response's headers, redirects included: the hop codes are
+        -- what says whether a move was permanent.
+        "-D", shell_escape(header_path),
+        "-w", "'%{http_code} %{url_effective}'",
     }
+    for name, value in pairs(conditional_headers({}, opts)) do
+        parts[#parts + 1] = "-H"
+        parts[#parts + 1] = shell_escape(name .. ": " .. value)
+    end
     parts[#parts + 1] = shell_escape(url)
 
     local pipe = io.popen(table.concat(parts, " ") .. " 2>/dev/null")
@@ -52,17 +134,35 @@ function CurlFetch:get(url, opts)
         os.remove(body_path)
         return nil, "cannot spawn curl"
     end
-    local code = tonumber((pipe:read("*a") or ""):match("%d+"))
+    local written = pipe:read("*a") or ""
     pipe:close()
+    local code, final_url = written:match("^(%d+)%s*(%S*)")
+    code = tonumber(code)
 
     local handle = io.open(body_path, "r")
     local body = handle and handle:read("*a") or nil
     if handle then handle:close() end
     os.remove(body_path)
 
+    handle = io.open(header_path, "r")
+    local responses = Fetch.parse_header_dump(handle and handle:read("*a"))
+    if handle then handle:close() end
+    os.remove(header_path)
+
     if not code or code == 0 then return nil, "request failed" end
-    if code < 200 or code >= 300 then return nil, "HTTP " .. code, code end
-    return body, nil, code
+
+    local hops = {}
+    for index = 1, #responses - 1 do
+        if REDIRECT_CODES[responses[index].code] then hops[#hops + 1] = responses[index].code end
+    end
+    if final_url == "" then final_url = url end
+    local last = responses[#responses] or { headers = {} }
+    return finish_get(code, body, {
+        url = final_url,
+        moved_to = permanent_target(url, hops, final_url),
+        etag = last.headers["etag"],
+        last_modified = last.headers["last-modified"],
+    })
 end
 
 --- Streams `url` into `path`, continuing a partial file if one is there.
@@ -115,22 +215,49 @@ function KoreaderFetch:get(url, opts)
     opts = opts or {}
     local ltn12 = require("ltn12")
     local socketutil = require("socketutil")
-    local client = url:match("^https:") and require("ssl.https") or require("socket.http")
+    local headers = conditional_headers({ ["User-Agent"] = self.user_agent }, opts)
 
-    local sink = {}
+    -- Redirects are followed here rather than by luasocket, which cannot
+    -- follow one across schemes -- and http -> https is the commonest
+    -- redirect a feed has. It would also hide the hop codes we need.
+    local current, hops = url, {}
     socketutil:set_timeout(opts.timeout or DEFAULT_TIMEOUT, opts.timeout or DEFAULT_TIMEOUT)
-    local ok, code = client.request{
-        url = url,
-        method = "GET",
-        headers = { ["User-Agent"] = self.user_agent },
-        sink = ltn12.sink.table(sink),
-    }
-    socketutil:reset_timeout()
+    while true do
+        local client = current:match("^https:") and require("ssl.https") or require("socket.http")
+        local sink = {}
+        local ok, code, response_headers = client.request{
+            url = current,
+            method = "GET",
+            headers = headers,
+            sink = ltn12.sink.table(sink),
+            redirect = false,
+        }
+        if not ok then
+            socketutil:reset_timeout()
+            return nil, tostring(code or "request failed")
+        end
+        code = tonumber(code)
+        response_headers = response_headers or {}
 
-    if not ok then return nil, tostring(code or "request failed") end
-    code = tonumber(code)
-    if not code or code < 200 or code >= 300 then return nil, "HTTP " .. tostring(code), code end
-    return table.concat(sink), nil, code
+        local location = REDIRECT_CODES[code] and response_headers["location"]
+        if location then
+            if #hops >= MAX_REDIRECTS then
+                socketutil:reset_timeout()
+                return nil, "too many redirects", code
+            end
+            hops[#hops + 1] = code
+            current = Url.resolve(current, location)
+        else
+            socketutil:reset_timeout()
+            if not code then return nil, "HTTP " .. tostring(code) end
+            return finish_get(code, table.concat(sink), {
+                url = current,
+                moved_to = permanent_target(url, hops, current),
+                etag = response_headers["etag"],
+                last_modified = response_headers["last-modified"],
+            })
+        end
+    end
 end
 
 function KoreaderFetch:download(url, path, opts)

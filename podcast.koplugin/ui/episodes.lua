@@ -96,11 +96,19 @@ function Episodes:_load_feed()
         -- Runs in the forked child: no UIManager, no settings, no widgets.
         local ChildFetch = require("net.fetch")
         local ChildParser = require("feed.parser")
-        local body, err = ChildFetch.new(fetch_kind, { user_agent = user_agent })
+        -- Unconditional: the episode list is not cached, so a 304 would leave
+        -- nothing to show. Conditional requests are refresh_all's business.
+        local body, err, _code, info = ChildFetch.new(fetch_kind, { user_agent = user_agent })
             :get(url, { timeout = 45 })
         if not body then return { error = tostring(err) } end
-        local feed, parse_err = ChildParser.parse(body, { max_episodes = EPISODE_LIMIT })
+        local feed_url = info and info.moved_to or url
+        local feed, parse_err = ChildParser.parse(body, {
+            max_episodes = EPISODE_LIMIT,
+            base_url = info and info.url or url,
+            feed_url = feed_url,
+        })
         if not feed then return { error = tostring(parse_err) } end
+        feed.moved_to = info and info.moved_to
         return feed
     end, _("Loading episodes…\n\nTap to cancel."))
 
@@ -122,6 +130,11 @@ function Episodes:show()
             local feed = self:_load_feed()
             if not feed then return end
 
+            if feed.moved_to then
+                -- Permanently moved: follow it, episode state and all.
+                self.subscription = self.library:rename_feed(self.subscription.url, feed.moved_to)
+                    or self.subscription
+            end
             self.library:record_refresh(self.subscription.url, feed, false)
             self.library:save()
             self:_show_list(feed)
@@ -236,7 +249,7 @@ function Episodes:_play(episode, resume)
         return
     end
 
-    local state = self.library:episode(episode.guid)
+    local state = self.library:episode(episode)
     local downloaded = state.path and Fetch.file_size(state.path) > 0
 
     -- Streaming is the fallback, not the default: downloading once and playing
