@@ -71,6 +71,14 @@ local function default_path()
     return (os.getenv("KOPOD_HOME") or (os.getenv("HOME") or ".") .. "/.kopod") .. "/library.lua"
 end
 
+--- Where the episode-list cache lives: KOReader's cache directory on device,
+-- next to the library under the CLI harness.
+function Library.default_cache_dir()
+    local ok, DataStorage = pcall(require, "datastorage")
+    if ok then return DataStorage:getDataDir() .. "/cache/podcast-feeds" end
+    return (os.getenv("KOPOD_HOME") or (os.getenv("HOME") or ".") .. "/.kopod") .. "/feeds"
+end
+
 local function default_download_dir()
     local ok, DataStorage = pcall(require, "datastorage")
     if ok then return DataStorage:getDataDir() .. "/podcasts" end
@@ -99,27 +107,48 @@ function Library:load()
     return true
 end
 
-function Library:save()
-    -- Create the directory on demand; there is no mkdir in plain Lua.
-    local dir = self.path:match("^(.*)/[^/]+$")
+--- Writes `text` to `path` through a temporary file and a rename, creating the
+-- directory on demand, so a crash or a killed subprocess mid-write leaves the
+-- previous file intact rather than half of a new one.
+local function write_atomically(path, text)
+    -- There is no mkdir in plain Lua.
+    local dir = path:match("^(.*)/[^/]+$")
     if dir then os.execute("mkdir -p '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null") end
 
-    local tmp = self.path .. ".tmp"
-    local handle = io.open(tmp, "w")
+    local tmp = path .. ".tmp"
+    local handle = io.open(tmp, "wb")
     if not handle then return false end
+    local ok = handle:write(text)
+    handle:close()
+    if not ok then
+        os.remove(tmp)
+        return false
+    end
+    return os.rename(tmp, path)
+end
+
+Library.write_atomically = write_atomically
+
+function Library:save()
     -- The legacy guid-only table empties as feeds claim its entries; once it
     -- has, stop writing it.
     local legacy = self.data.episode_state
     if next(legacy) == nil then self.data.episode_state = nil end
-    handle:write("-- podcast.koplugin library. Edit with care.\nreturn ",
-        serialize(self.data), "\n")
+    local text = "-- podcast.koplugin library. Edit with care.\nreturn " ..
+        serialize(self.data) .. "\n"
     self.data.episode_state = legacy
-    handle:close()
-    return os.rename(tmp, self.path)
+    return write_atomically(self.path, text)
 end
 
 function Library:subscriptions()
     return self.data.subscriptions
+end
+
+--- The subscribed feed URLs, as a list: what the feed cache is pruned to.
+function Library:feed_urls()
+    local urls = {}
+    for index, subscription in ipairs(self.data.subscriptions) do urls[index] = subscription.url end
+    return urls
 end
 
 function Library:find(url)
@@ -289,6 +318,8 @@ local function feed_tag(feed_url)
     end
     return string.format("%08x", hash)
 end
+
+Library.feed_tag = feed_tag
 
 --- Where an episode's audio lives once downloaded. Derived from the feed and
 -- guid so it is stable across refreshes, and sanitised because a guid is

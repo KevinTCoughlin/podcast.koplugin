@@ -20,6 +20,7 @@ local Screen = require("device").screen
 local _ = require("gettext")
 
 local Episodes = require("ui/episodes")
+local FeedCache = require("net.feedcache")
 local Fetch = require("net.fetch")
 local Parser = require("feed.parser")
 
@@ -137,6 +138,7 @@ function Subscriptions:_show_actions(subscription)
                             ok_callback = function()
                                 self.library:unsubscribe(subscription.url)
                                 self.library:save()
+                                FeedCache.new():prune(self.library:feed_urls())
                                 self:_close_menu()
                                 self:show()
                             end,

@@ -249,6 +249,27 @@ UIManager:scheduleIn(1, function()
 
     -- luasocket cannot follow a redirect across schemes on its own, so this is
     -- the manual redirect loop against a real 301, through both clients.
+    step("feed cache lands in KOReader's cache dir", function()
+        local DataStorage = require("datastorage")
+        local dir = require("net.feedcache").new{}.dir
+        assert(dir:find(DataStorage:getDataDir() .. "/cache/", 1, true),
+            "feed cache is not under the cache dir: " .. dir)
+    end)
+
+    step("feed cache revalidates over luasec", function()
+        local FeedCache = require("net.feedcache")
+        local cache = FeedCache.new{}
+        -- Validators-only feed (no max-age), so the second get is a real 304.
+        local url = "https://feeds.libsyn.com/60664/rss"
+        local fetch = Fetch.new("koreader")
+        local first, err = cache:get(fetch, url, { timeout = 45 })
+        assert(first, "first fetch failed: " .. tostring(err))
+        local second, err2, _, info = FeedCache.new{}:get(fetch, url, { timeout = 45 })
+        assert(second == first, "second fetch did not return the cached body: " .. tostring(err2))
+        logger.warn("SMOKE   feed cache: " .. tostring(info.from_cache or "refetched"))
+        cache:prune({})
+    end, true)
+
     step("an http -> https permanent redirect through luasocket", function()
         local http_url = FEED_URL:gsub("^https:", "http:")
         local body, err, _code, info = Fetch.new("koreader"):get(http_url, { timeout = 45 })
