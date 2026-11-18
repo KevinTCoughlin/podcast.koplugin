@@ -38,6 +38,12 @@
     `<link rel="alternate" type="application/rss+xml">` (or Atom).
   - `content:encoded` and Atom `content` are used as show notes when richer
     than the description, and a future publication date is clamped to now.
+  - The episode list is cached (`net/feedcache.lua`, in KOReader's
+    `cache/podcast-feeds`). Within the feed's `Cache-Control: max-age`
+    (capped at a day) opening a show makes no request and does not wake the
+    Wi-Fi; after it, the request is conditional and a 304 reuses the cached
+    body. `no-store` and responses with no validators or max-age are not kept,
+    and only subscribed feeds stay in the cache.
 
 ### Changed
 - Episode state is keyed by feed URL and guid, since a guid is only unique

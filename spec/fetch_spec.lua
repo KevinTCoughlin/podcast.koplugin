@@ -159,3 +159,50 @@ describe("Fetch.parse_header_dump", function()
         assert_.len(0, Fetch.parse_header_dump(nil))
     end)
 end)
+
+describe("Fetch.parse_cache_control", function()
+    it("reads max-age", function()
+        assert_.equal(600, (Fetch.parse_cache_control("public, max-age=600")))
+    end)
+
+    it("takes Age off what is left", function()
+        assert_.equal(500, (Fetch.parse_cache_control("max-age=600", "100")))
+        assert_.equal(0, (Fetch.parse_cache_control("max-age=600", "9000")))
+    end)
+
+    it("treats no-cache as zero, whatever max-age says", function()
+        assert_.equal(0, (Fetch.parse_cache_control("max-age=600, no-cache")))
+    end)
+
+    it("reports no-store", function()
+        local max_age, no_store = Fetch.parse_cache_control("No-Store")
+        assert_.nil_(max_age)
+        assert_.truthy(no_store)
+    end)
+
+    it("ignores s-maxage and a missing header", function()
+        assert_.nil_((Fetch.parse_cache_control("s-maxage=600")))
+        assert_.nil_((Fetch.parse_cache_control(nil)))
+    end)
+end)
+
+describe("Fetch (luasocket) cache headers", function()
+    it("reports max-age less Age, and no-store, from the final response", function()
+        with_fake_socket({
+            ["https://x.org/feed"] = { code = 200, body = "x",
+                headers = { ["cache-control"] = "max-age=300, no-store", age = "60" } },
+        }, function(fetch)
+            local _, _, _, info = fetch:get("https://x.org/feed")
+            assert_.equal(240, info.max_age)
+            assert_.truthy(info.no_store)
+        end)
+    end)
+
+    it("reports nothing when there is no Cache-Control", function()
+        with_fake_socket({ ["https://x.org/feed"] = { code = 200, body = "x" } }, function(fetch)
+            local _, _, _, info = fetch:get("https://x.org/feed")
+            assert_.nil_(info.max_age)
+            assert_.falsy(info.no_store)
+        end)
+    end)
+end)

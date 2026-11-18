@@ -27,6 +27,7 @@ local logger = require("logger")
 local _ = require("gettext")
 
 local DateTime = require("feed.datetime")
+local FeedCache = require("net.feedcache")
 local Fetch = require("net.fetch")
 local NowPlaying = require("ui/nowplaying")
 local Parser = require("feed.parser")
@@ -45,6 +46,7 @@ function Episodes.new(opts)
         get_player = opts.get_player,
         on_play = opts.on_play,
         fetch = Fetch.new(nil, { user_agent = opts.user_agent }),
+        cache_dir = opts.cache_dir,
     }, Episodes)
 end
 
@@ -87,19 +89,26 @@ function Episodes:_describe(episode)
 end
 
 --- Fetches and parses the feed in a subprocess. Returns the feed or nil.
+-- The fetch goes through the feed cache: a fresh copy costs no request, a
+-- stale one a conditional request (see net/feedcache.lua).
 function Episodes:_load_feed()
     local url = self.subscription.url
     local fetch_kind = self.fetch.kind
     local user_agent = self.fetch.user_agent
+    local cache_dir = self.cache_dir
+    local keep = self.library:feed_urls()
 
     local completed, result = Trapper:dismissableRunInSubprocess(function()
         -- Runs in the forked child: no UIManager, no settings, no widgets.
+        -- The cache is plain files, so writing it from here is safe.
+        local ChildFeedCache = require("net.feedcache")
         local ChildFetch = require("net.fetch")
         local ChildParser = require("feed.parser")
-        -- Unconditional: the episode list is not cached, so a 304 would leave
-        -- nothing to show. Conditional requests are refresh_all's business.
-        local body, err, _code, info = ChildFetch.new(fetch_kind, { user_agent = user_agent })
-            :get(url, { timeout = 45 })
+        local cache = ChildFeedCache.new{ dir = cache_dir }
+        local body, err, _code, info = cache:get(
+            ChildFetch.new(fetch_kind, { user_agent = user_agent }), url, { timeout = 45 })
+        if info and info.moved_to then keep[#keep + 1] = info.moved_to end
+        cache:prune(keep)
         if not body then return { error = tostring(err) } end
         local feed_url = info and info.moved_to or url
         local feed, parse_err = ChildParser.parse(body, {
@@ -125,7 +134,7 @@ function Episodes:_load_feed()
 end
 
 function Episodes:show()
-    NetworkMgr:runWhenOnline(function()
+    local function load_and_show()
         Trapper:wrap(function()
             local feed = self:_load_feed()
             if not feed then return end
@@ -139,7 +148,13 @@ function Episodes:show()
             self.library:save()
             self:_show_list(feed)
         end)
-    end)
+    end
+    -- A fresh cached copy needs no network, so do not wake the Wi-Fi for it.
+    if FeedCache.new{ dir = self.cache_dir }:is_fresh(self.subscription.url) then
+        load_and_show()
+    else
+        NetworkMgr:runWhenOnline(load_and_show)
+    end
 end
 
 function Episodes:_show_list(feed)

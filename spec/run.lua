@@ -24,6 +24,7 @@ local specs = {
     "parser_spec",
     "library_spec",
     "fetch_spec",
+    "feedcache_spec",
 }
 
 for _, spec in ipairs(specs) do

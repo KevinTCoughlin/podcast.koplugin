@@ -24,8 +24,14 @@ development and CI, luasocket for on-device. Tests inject a fake.
     is the new URL, and the caller should update the subscription so the old
     one can eventually be retired by its publisher.
 
+  * **Cache-Control.** `info.max_age` is how many more seconds the response
+    may be reused without asking again (max-age less Age; 0 for no-cache),
+    and `info.no_store` is set when the server asked for it not to be kept.
+    `net/feedcache.lua` is what acts on them.
+
 The full return is `body, err, code, info`, with `info` holding `url` (where the
-body actually came from), `moved_to`, `etag` and `last_modified`.
+body actually came from), `moved_to`, `etag`, `last_modified`, `max_age` and
+`no_store`.
 ]]
 
 local Url = require("feed.url")
@@ -72,6 +78,42 @@ local function finish_get(code, body, info)
     if code == 304 then return nil, Fetch.NOT_MODIFIED, code, info end
     if code < 200 or code >= 300 then return nil, "HTTP " .. code, code, info end
     return body, nil, code, info
+end
+
+--- Reads the freshness a response grants from its Cache-Control and Age
+-- headers. Returns max_age, no_store: max_age is seconds of reuse left (0 when
+-- the response must be revalidated every time, nil when the header says
+-- nothing about it). s-maxage is for shared caches and does not apply here.
+function Fetch.parse_cache_control(value, age)
+    if not value then return nil, false end
+    value = tostring(value):lower()
+    local max_age, no_cache, no_store
+    for directive in value:gmatch("[^,]+") do
+        directive = directive:gsub("^%s+", ""):gsub("%s+$", "")
+        local seconds = directive:match('^max%-age%s*=%s*"?(%d+)"?$')
+        if seconds then
+            max_age = tonumber(seconds)
+        elseif directive:match("^no%-cache") then
+            no_cache = true
+        elseif directive == "no-store" then
+            no_store = true
+        end
+    end
+    -- no-cache wins over a max-age in the same header: reuse only after asking.
+    if no_cache then max_age = 0 end
+    age = tonumber(age)
+    if max_age and age and age > 0 then max_age = math.max(0, max_age - age) end
+    return max_age, no_store or false
+end
+
+--- The `info` fields that come straight from the final response's headers,
+-- which both transports give as a table of lowercase names.
+local function header_info(info, headers)
+    info.etag = headers["etag"]
+    info.last_modified = headers["last-modified"]
+    info.max_age, info.no_store =
+        Fetch.parse_cache_control(headers["cache-control"], headers["age"])
+    return info
 end
 
 --- Parses `curl -D` output: one block per response, redirects included.
@@ -157,12 +199,10 @@ function CurlFetch:get(url, opts)
     end
     if final_url == "" then final_url = url end
     local last = responses[#responses] or { headers = {} }
-    return finish_get(code, body, {
+    return finish_get(code, body, header_info({
         url = final_url,
         moved_to = permanent_target(url, hops, final_url),
-        etag = last.headers["etag"],
-        last_modified = last.headers["last-modified"],
-    })
+    }, last.headers))
 end
 
 --- Streams `url` into `path`, continuing a partial file if one is there.
@@ -250,12 +290,10 @@ function KoreaderFetch:get(url, opts)
         else
             socketutil:reset_timeout()
             if not code then return nil, "HTTP " .. tostring(code) end
-            return finish_get(code, table.concat(sink), {
+            return finish_get(code, table.concat(sink), header_info({
                 url = current,
                 moved_to = permanent_target(url, hops, current),
-                etag = response_headers["etag"],
-                last_modified = response_headers["last-modified"],
-            })
+            }, response_headers))
         end
     end
 end

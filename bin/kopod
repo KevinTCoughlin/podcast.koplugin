@@ -25,6 +25,7 @@ package.path = table.concat({
 }, ";")
 
 local DateTime = require("feed.datetime")
+local FeedCache = require("net.feedcache")
 local Fetch = require("net.fetch")
 local Library = require("library")
 local Parser = require("feed.parser")
@@ -75,8 +76,21 @@ end
 -- from being fully parsed just to list the latest few.
 -- A permanent redirect renames the subscription as a side effect, so the
 -- returned feed's episodes carry the URL their state is now keyed by.
+-- A subscribed feed goes through the feed cache, as it does on device; a URL
+-- being added does not, since it may be a web page rather than a feed.
 local function load_feed(url, max, discovered_from)
-    local body, err, _, info = fetch:get(url, { timeout = 45 })
+    local body, err, _code, info
+    if library:find(url) then
+        local cache = FeedCache.new{}
+        body, err, _code, info = cache:get(fetch, url, { timeout = 45 })
+        local keep = library:feed_urls()
+        -- The subscription moves just below; keep its entry at the new URL.
+        if info and info.moved_to then keep[#keep + 1] = info.moved_to end
+        cache:prune(keep)
+        if info and info.from_cache then print("(" .. info.from_cache .. " from cache)") end
+    else
+        body, err, _code, info = fetch:get(url, { timeout = 45 })
+    end
     if not body then die("fetch failed: " .. tostring(err)) end
     if info.moved_to and library:find(url) then
         library:rename_feed(url, info.moved_to)
@@ -167,6 +181,7 @@ elseif command == "remove" then
     local subscription = subscription_at(positional[2])
     library:unsubscribe(subscription.url)
     library:save()
+    FeedCache.new{}:prune(library:feed_urls())
     print("removed: " .. subscription.title)
 
 elseif command == "list" then
